@@ -1,6 +1,7 @@
 import * as s from "capnp-ts/src/std/schema.capnp.js";
 import { format } from "capnp-ts/src/util";
 import initTrace from "debug";
+import { posix } from "node:path";
 
 import { CodeGeneratorFileContext } from "./code-generator-file-context";
 import { ConcreteListType, Primitive, TS_FILE_ID } from "./constants";
@@ -192,10 +193,15 @@ export function generateInterfaceClasses(ctx: CodeGeneratorFileContext, node: s.
   const flat = flattenMethods(ctx, node);
 
   methods.forEach((m) => {
-    ctx.implicitScopes.set(m.getParamStructType().toString(), gparams);
-    ctx.implicitScopes.set(m.getResultStructType().toString(), gparams);
-    generateNode(ctx, lookupNode(ctx, m.getParamStructType()));
-    generateNode(ctx, lookupNode(ctx, m.getResultStructType()));
+    for (const id of [m.getParamStructType(), m.getResultStructType()]) {
+      const type = lookupNode(ctx, id);
+      if (type.getScopeId() === BigInt(0)) {
+        ctx.implicitScopes.set(id.toString(), gparams);
+        generateNode(ctx, type);
+      } else if (owningFile(ctx, type).getId() === ctx.file.getId()) {
+        generateNode(ctx, type);
+      }
+    }
   });
 
   methods.forEach((m) => generateResultPromise(ctx, node, m));
@@ -329,8 +335,7 @@ function generateInterfaceClient(
     const targs = entryArgs(node, e, generic ? args : "", gparams);
     const returnType = promiseName ?? `capnp.RemotePromise<${resultsClass}${targs}>`;
     const table = generic ? `this.methods` : `${fullClassName}_Client.methods`;
-    const callArgs =
-      promiseName === null ? `${table}[${i}], params` : `${table}[${i}], params, ${promiseName}`;
+    const callArgs = promiseName === null ? `${table}[${i}], params` : `${table}[${i}], params, ${promiseName}`;
 
     members.push(
       method(
@@ -410,22 +415,16 @@ function generateInterfaceServer(
       `impl: target.${e.method.getName()} },`
     );
   });
-  const bindingsTuple = generic
-    ? `[${gparams.map((p) => `capnp.StructCtor<${p.name}>`).join(", ")}]`
-    : "";
+  const bindingsTuple = generic ? `[${gparams.map((p) => `capnp.StructCtor<${p.name}>`).join(", ")}]` : "";
   const ctorParams = generic
     ? `target: ${fullClassName}_ServerTarget${args}, bindings?: ${bindingsTuple}`
     : `target: ${fullClassName}_ServerTarget`;
   const ctor =
     flat.length === 0
       ? `constructor(_target: ${fullClassName}_ServerTarget) { super([]); }`
-      : `constructor(${ctorParams}) {\n${indent(
-          `super([\n${indent(rows.join("\n"))}\n]);`,
-        )}\n}`;
+      : `constructor(${ctorParams}) {\n${indent(`super([\n${indent(rows.join("\n"))}\n]);`)}\n}`;
 
-  ctx.sourceParts.push(
-    `export class ${fullClassName}_Server${decl} extends capnp.Server {\n${indent(ctor)}\n}`,
-  );
+  ctx.sourceParts.push(`export class ${fullClassName}_Server${decl} extends capnp.Server {\n${indent(ctor)}\n}`);
 }
 
 /** Emit a pipelined RemotePromise subclass for a method whose results carry capabilities. */
@@ -480,9 +479,47 @@ function resultPromiseName(ctx: CodeGeneratorFileContext, node: s.Node, m: s.Met
   return `${getFullClassName(node)}_${util.c2t(m.getName())}$Promise`;
 }
 
+/** Return the declaring file of a named (non-implicit) schema node. */
+function owningFile(ctx: CodeGeneratorFileContext, node: s.Node): s.Node {
+  while (!node.isFile()) node = lookupNode(ctx, node.getScopeId());
+  return node;
+}
+
 export function generateNestedImports(ctx: CodeGeneratorFileContext): void {
-  ctx.imports.forEach((i) => {
-    const name = i.getName();
+  const imports = ctx.imports.map((i) => ({ id: i.getId(), name: i.getName() }));
+  const imported = new Set(imports.map((i) => i.id));
+  // Flattened methods can reference an ancestor not directly imported by this file,
+  // or an explicit params/results type owned by another file entirely.
+  for (const node of ctx.nodes) {
+    if (!node.isInterface() || owningFile(ctx, node).getId() !== ctx.file.getId()) continue;
+    for (const entry of flattenMethods(ctx, node)) {
+      const referenced = [entry.declaring];
+      for (const id of [entry.method.getParamStructType(), entry.method.getResultStructType()]) {
+        const type = lookupNode(ctx, id);
+        if (type.getScopeId() !== BigInt(0)) referenced.push(type);
+      }
+      for (const reference of referenced) {
+        const file = owningFile(ctx, reference);
+        const id = file.getId();
+        if (id === ctx.file.getId() || imported.has(id)) continue;
+        const standardImport = ctx.req
+          .getRequestedFiles()
+          .toArray()
+          .flatMap((requested) => requested.getImports().toArray())
+          .find((i) => i.getId() === id && i.getName().startsWith("/capnp/"));
+        // A leaf-only request may omit the implicit stream import's spelling.
+        const name =
+          standardImport?.getName() ??
+          (id === BigInt("0x86c366a91393f3f8")
+            ? "/capnp/stream.capnp"
+            : posix.relative(posix.dirname(lookupNode(ctx, ctx.file).getDisplayName()), file.getDisplayName()));
+        imports.push({ id, name });
+        imported.add(id);
+      }
+    }
+  }
+  imports.forEach((i) => {
+    const name = i.name;
     let importPath: string;
 
     if (name.substr(0, 7) === "/capnp/") {
@@ -495,7 +532,7 @@ export function generateNestedImports(ctx: CodeGeneratorFileContext): void {
       importPath = name[0] === "." ? `${name}.js` : `./${name}.js`;
     }
 
-    const imports = getImportNodes(ctx, lookupNode(ctx, i))
+    const imports = getImportNodes(ctx, lookupNode(ctx, i.id))
       .map((n) => {
         const c = getFullClassName(n);
 
@@ -509,7 +546,12 @@ export function generateNestedImports(ctx: CodeGeneratorFileContext): void {
           for (const m of n.getInterface().getMethods().toArray()) {
             const params = getFullClassName(lookupNode(ctx, m.getParamStructType()));
             const results = getFullClassName(lookupNode(ctx, m.getResultStructType()));
-            surface.push(params, `${params}_Shape`, results);
+            const paramsNode = lookupNode(ctx, m.getParamStructType());
+            const resultsNode = lookupNode(ctx, m.getResultStructType());
+            if (paramsNode.getScopeId() === BigInt(0) || owningFile(ctx, paramsNode).getId() === i.id)
+              surface.push(params, `${params}_Shape`);
+            if (resultsNode.getScopeId() === BigInt(0) || owningFile(ctx, resultsNode).getId() === i.id)
+              surface.push(results);
             const promiseName = resultPromiseName(ctx, n, m);
             if (promiseName !== null) surface.push(promiseName);
           }
